@@ -27,12 +27,12 @@ export function IngredientManagement() {
   useEffect(() => {
     loadIngredients();
   }, []);
-
+  
   async function loadIngredients() {
     try {
       setLoading(true);
-
-      // Load ingredients with their current prices and inventory levels
+  
+      // Load ingredients
       const { data: ingredientsData, error: ingredientsError } = await supabase
         .from('ingredients')
         .select(`
@@ -47,33 +47,48 @@ export function IngredientManagement() {
           )
         `)
         .order('name');
-
+  
       if (ingredientsError) throw ingredientsError;
-
+  
       if (ingredientsData) {
         // Get the current user
-        const { data: { user } } = await supabase.auth.getUser();
-        
+        const { data: { user }, error: userError } = await supabase.auth.getUser();
+  
+        if (userError) throw userError;
+  
         if (user) {
           // Load current inventory levels
-          const { data: inventoryLevels } = await supabase
+          const { data: inventoryLevels, error: inventoryError } = await supabase
             .from('inventory_levels')
             .select('ingredient_id, current_level')
             .eq('user_id', user.id);
-
-          // Load current prices from localStorage
-          const storedPrices = JSON.parse(localStorage.getItem('ingredientPrices') || '{}');
-
+  
+          if (inventoryError) throw inventoryError;
+  
+          // Load current prices from pricing_tiers
+          const { data: pricingData, error: pricingError } = await supabase
+            .from('pricing_tiers')
+            .select('ingredient_id, price_per_unit');
+  
+          if (pricingError) throw pricingError;
+  
           // Combine all data
-          const enrichedIngredients = ingredientsData.map(ingredient => ({
-            ...ingredient,
-            current_level: inventoryLevels?.find(il => il.ingredient_id === ingredient.id)?.current_level || 0,
-            current_price: storedPrices[ingredient.id] || null,
-            unsavedPrice: storedPrices[ingredient.id] || null,
-            unsavedLevel: inventoryLevels?.find(il => il.ingredient_id === ingredient.id)?.current_level || 0
-          }));
-
-          setIngredients(enrichedIngredients);
+                   // Combine all data
+                   const enrichedIngredients = ingredientsData.map(ingredient => {
+                    const matchingPrice = pricingData?.find(p => p.ingredient_id === ingredient.id);
+                    console.log("🔍 Matching ingredient:", ingredient.id, "with pricing_tiers entry:", matchingPrice);
+                    
+                    return {
+                      ...ingredient,
+                      current_level: inventoryLevels?.find(il => il.ingredient_id === ingredient.id)?.current_level || 0,
+                      current_price: matchingPrice?.price_per_unit || null,
+                      unsavedPrice: matchingPrice?.price_per_unit || null,
+                      unsavedLevel: inventoryLevels?.find(il => il.ingredient_id === ingredient.id)?.current_level || 0
+                    };
+                  });
+        
+                  setIngredients(enrichedIngredients);
+        
         }
       }
     } catch (error) {
@@ -83,20 +98,26 @@ export function IngredientManagement() {
       setLoading(false);
     }
   }
+  
 
   const handlePriceChange = (ingredientId: string, value: string) => {
     const newPrice = value === '' ? null : parseFloat(value);
     
     // Update state
     setIngredients(prev => 
-      prev.map(ing => 
-        ing.id === ingredientId 
+      prev.map(ing => {
+        console.log("🟡 handlePriceChange called with ingredientId:", ingredientId);
+        console.log("🔍 Checking against ing:", ing); // Logs full object
+        
+        return ing.id === ingredientId 
           ? { ...ing, unsavedPrice: newPrice } 
-          : ing
-      )
+          : ing;
+      })
     );
     setHasUnsavedChanges(true);
-  };
+};
+
+
 
   const handleInventoryChange = (ingredientId: string, value: string) => {
     const newLevel = value === '' ? 0 : parseFloat(value);
@@ -110,53 +131,68 @@ export function IngredientManagement() {
     );
     setHasUnsavedChanges(true);
   };
-
+  
   const handleSaveChanges = async () => {
     try {
-      const { data: { user } } = await supabase.auth.getUser();
-      
-      if (!user) {
-        toast.error('You must be logged in to update inventory');
-        return;
+      for (const ingredient of ingredients) {
+        if (ingredient.unsavedPrice === null || ingredient.unsavedPrice === undefined) {
+          console.log("⏭️ Skipping update for:", ingredient.id, "because price is null/undefined.");
+          continue;
+        }
+  
+        // ✅ Step 1: Fetch the correct price row
+        const { data: priceRows, error: priceError } = await supabase
+          .from('pricing_tiers')
+          .select('id, price_per_unit')
+          .eq('ingredient_id', ingredient.id)
+          .eq('min_quantity', 0) // Only fetch the base pricing tier
+          .limit(1);
+  
+        if (priceError) {
+          console.error("❌ Error fetching price row:", priceError);
+          toast.error("Failed to fetch price row.");
+          continue;
+        }
+  
+        if (!priceRows || priceRows.length === 0) {
+          console.error("❌ No matching price row found for ingredient:", ingredient.id);
+          toast.error("No matching price row found.");
+          continue;
+        }
+  
+        const rowId = priceRows[0].id;
+  
+        // ✅ Log before updating
+        console.log("🟡 Preparing update for ingredient:", ingredient.id);
+        console.log("🔍 Using row ID:", rowId, "Setting price:", ingredient.unsavedPrice);
+  
+        // ✅ Step 2: Attempt to update the correct row in Supabase
+        const updateData = { price_per_unit: ingredient.unsavedPrice };
+  
+        const { data: updateResponse, error: updateError } = await supabase
+          .from('pricing_tiers')
+          .update(updateData)
+          .eq('id', rowId)
+          .select(); // ✅ Ensure updated row is returned
+  
+        if (updateError) {
+          console.error("❌ Failed to update price:", updateError);
+          toast.error("Price update failed.");
+        } else {
+          console.log("✅ Supabase response after update:", updateResponse);
+        }
       }
-
-      // Save inventory levels
-      const { error } = await supabase
-        .from('inventory_levels')
-        .upsert(ingredients.map(ing => ({
-          ingredient_id: ing.id,
-          user_id: user.id,
-          current_level: ing.unsavedLevel
-        })), {
-          onConflict: 'ingredient_id,user_id'
-        });
-
-      if (error) throw error;
-
-      // Save prices to localStorage
-      const updatedPrices = ingredients.reduce((acc, ing) => ({
-        ...acc,
-        [ing.id]: ing.unsavedPrice
-      }), {});
-      localStorage.setItem('ingredientPrices', JSON.stringify(updatedPrices));
-
-      // Update state with saved values
-      setIngredients(prev => 
-        prev.map(ing => ({
-          ...ing,
-          current_level: ing.unsavedLevel,
-          current_price: ing.unsavedPrice
-        })
-        )
-      );
-
+  
       setHasUnsavedChanges(false);
-      toast.success('Inventory updated successfully');
+      toast.success("Inventory and prices updated successfully");
+  
+      await loadIngredients();
     } catch (error) {
-      console.error('Error updating inventory:', error);
-      toast.error('Failed to update inventory');
+      console.error("❌ Unexpected error in handleSaveChanges:", error);
+      toast.error("Failed to update inventory.");
     }
   };
+  
 
   if (loading) {
     return (
